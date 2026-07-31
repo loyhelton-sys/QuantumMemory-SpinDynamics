@@ -1,0 +1,16 @@
+# Julia
+Manifest.toml
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
+
+# Simulation outputs
+Results/
+*.jld2
+*.mp4
+
+# Logs
+*.log
