@@ -1,6 +1,8 @@
+# ============================================================
 # MAIN RUN FUNCTION FOR FIRST-ORDER SIMULATION
-
-function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu = true,)
+# ============================================================
+function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
+    clean_gpu=false, verbose=true,)
     # ---------------------------------------------------------
     # BUILD AND VALIDATE CONFIGURATION
     # ---------------------------------------------------------
@@ -14,22 +16,27 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     
     d = prepare_derived(CONFIG)
     M = d.M
-    t_saved = d.t_save
-    Nt = d.Nt
+    timespan = (0.0, CONFIG.Ttotal)
+    t_saved = collect(range(0.0, CONFIG.Ttotal; length=CONFIG.Nt_save))
+    Nt = length(t_saved)
 
     E_of_t = build_E_of_t(PULSE_CONFIG)
-    println(E_of_t(0.0))
-    println(E_of_t(50e-6))
 
     # ---------------------------------------------------------
     # INITIAL CONDITION AND GPU PARAMETERS
     # ---------------------------------------------------------
     initial_condition = get_initial_condition(CONFIG)
-    println("Nj = ", d.Nj)
-    u0_gpu = build_u0_gpu_1st_order(M, d.Nj, initial_condition,)
+
     delta_b_gpu = CuArray(Float64.(d.delta_b))
-    p_gpu = (delta_b_gpu, M, E_of_t,)
-    prob_gpu = ODEProblem(rhs_1st_order!, u0_gpu, d.timespan, p_gpu,)
+    g_b_gpu     = CuArray(Float64.(d.g_b))
+
+    u0 = build_initial_state_1st_order(d.Nj, initial_condition;
+        delta_b = d.delta_b,)
+    u0_gpu = CuArray(u0)
+    p_gpu = (delta_b = delta_b_gpu, g_b = g_b_gpu,
+        M = M, E_of_t = E_of_t,)
+
+    prob_gpu = ODEProblem(rhs_1st_order!, u0_gpu, timespan, p_gpu)
 
     # ---------------------------------------------------------
     # ENSEMBLE DIMENSIONS
@@ -40,29 +47,6 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
         "M = $M, while M_delta × M_g = $(M_delta * M_g).")
 
     # ---------------------------------------------------------
-    # RESONANT-DELTA BIN FOR EVERY g VALUE
-    # ---------------------------------------------------------
-
-    # Select the detuning bin nearest delta = 0.
-    idelta_res = argmin(abs.(d.delta_b_1d))
-    delta_res  = d.delta_b_1d[idelta_res]
-
-    # The flattened spin arrays follow Julia column-major order: 
-    # flat_index = idelta + (ig - 1) * M_delta
-    # Therefore, the resonant-delta indices form this strided range:
-    keep_range = idelta_res:M_delta:M
-    keep_bins  = collect(keep_range)
-    @assert length(keep_bins) == M_g
-
-    g_keep     = collect(d.g_b_1d)
-    delta_keep = fill(delta_res, M_g)
-
-    println("Selected resonant-detuning bin:")
-    println("  idelta_res = $idelta_res")
-    println("  delta_res / 2π = $(delta_res / (2π)) Hz")
-    println("  number of g bins = $M_g")
-
-    # ---------------------------------------------------------
     # MAIN SAVE ARRAYS
     # ---------------------------------------------------------
 
@@ -70,14 +54,14 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     Σp_save = Vector{ComplexF64}(undef, Nt)
     Σz_save = Vector{ComplexF64}(undef, Nt)
 
-    # Resonant-delta trajectories.
-    # Rows:    g bins
-    # Columns: saved times
-    Sp_keep = Matrix{ComplexF64}(undef, M_g, Nt)
-    Sz_keep = Matrix{ComplexF64}(undef, M_g, Nt)
+    # Rows: flattened ensemble bins in g-fast order.
+    # Columns: saved times.
+    Sp_keep = Matrix{ComplexF64}(undef, M, Nt)
+    Sz_keep = Matrix{ComplexF64}(undef, M, Nt)
 
-    range_Sp = (IDX1_Sp_start : IDX1_Sp_start + M - 1)
-    range_Sz = (idx1_Sz_start(M) : idx1_Sz_start(M) + M - 1)
+    state_ranges = state_ranges_1st_order(M)
+    range_Sp = state_ranges.Sp
+    range_Sz = state_ranges.Sz
 
     # ---------------------------------------------------------
     # CALLBACK
@@ -87,19 +71,18 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     function affect!(integrator)
         kref[] += 1
         k = kref[]
-        u = integrator.u
+        if verbose && k % 100 == 0
+            println("Progress: $k / $Nt  ($(round(100k/Nt, digits=1))%)")
+        end
+        # One GPU-to-CPU transfer per saved time point.
+        u_cpu = Array(integrator.u)
+        Sp_cpu = @view u_cpu[range_Sp]
+        Sz_cpu = @view u_cpu[range_Sz]
 
-        # GPU views of all spin bins(no CPU transfer)
-        Sp_gpu = @view u[range_Sp]
-        Sz_gpu = @view u[range_Sz]
-
-        # Collective spin
-        Σp_save[k] = sum(Sp_gpu)
-        Σz_save[k] = sum(Sz_gpu)
-
-        # Save resonant-detuning trajectory (M_g CPU transfers only)
-        Sp_keep[:, k] .= Array(@view Sp_gpu[keep_range])
-        Sz_keep[:, k] .= Array(@view Sz_gpu[keep_range])
+        Sp_keep[:, k] .= Sp_cpu
+        Sz_keep[:, k] .= Sz_cpu
+        Σp_save[k] = sum(Sp_cpu)
+        Σz_save[k] = sum(Sz_cpu)
 
         return nothing
     end
@@ -119,10 +102,10 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     CUDA.synchronize()
 
     elapsed_seconds = (time_ns() - t0) / 1e9
-    println("Callback saved $(kref[]) / $Nt requested time points")
+    verbose && println("Callback saved $(kref[]) / $Nt requested time points")
 
     kref[] == Nt || error("Callback saved $(kref[]) points, but expected $Nt.")
-    println("Time taken: $elapsed_seconds seconds")
+    verbose && println("Time taken: $elapsed_seconds seconds")
 
     # ---------------------------------------------------------
     # POST-PROCESS OBSERVABLES
@@ -132,8 +115,6 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     Σx_save = real.(Σp_save)
     Σy_save = imag.(Σp_save)
 
-    Sx_keep = real.(Sp_keep)
-    Sy_keep = imag.(Sp_keep)
 
     # ---------------------------------------------------------
     # SAVE DATA
@@ -143,30 +124,26 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
         Σp_sol = Σp_save, Σz_sol = Σz_save,
         Σx_sol = Σx_save, Σy_sol = Σy_save,
         
-        E_of_t_arr = E_of_t_arr,
-        M_delta = M_delta, M_g = M_g, M_total = M,
-        delta_b_1d = d.delta_b_1d, g_b_1d = d.g_b_1d, Nj_2d = d.Nj_2d,
-
-        idelta_res = idelta_res, delta_res = delta_res,
-        keep_bins = keep_bins, g_keep = g_keep, delta_keep = delta_keep,
+        E_of_t_arr = E_of_t_arr, M_delta = M_delta, M_g = M_g, M_total = M,
+        edges_delta = d.edges_delta, delta_b_1d = d.delta_b_1d, p_delta = d.p_delta,
+        edges_g = d.edges_g, g_b_1d = d.g_b_1d, p_g = d.p_g,
+        delta_b = d.delta_b, g_b = d.g_b, Nj = d.Nj, Nj_2d = d.Nj_2d,
 
         Sp_keep = Sp_keep, Sz_keep = Sz_keep,
-        Sx_keep = Sx_keep, Sy_keep = Sy_keep,
 
         N_total = d.N_total, elapsed_seconds = elapsed_seconds,)
 
     if CONFIG.saved_file_name !== nothing
         filename = CONFIG.saved_file_name
         @save filename data
-        println()
-        println("Saving to: ", filename)
+        verbose && println("Saving to: ", filename)
     end
 
     # ---------------------------------------------------------
     # GPU CLEANUP
     # ---------------------------------------------------------
     if clean_gpu
-        println("Cleaning GPU memory...")
+        verbose && println("Cleaning GPU memory...")
         u0_gpu = nothing
         delta_b_gpu = nothing
         p_gpu = nothing
@@ -175,8 +152,7 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
         cb = nothing
         GC.gc()
         CUDA.reclaim()
-
-        println("GPU memory cleanup finished.")
+        verbose && println("GPU memory cleanup finished.")
     end
 
     return data
